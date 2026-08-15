@@ -1,42 +1,59 @@
 import os
 import glob
+import uuid
+import shutil
 import asyncio
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from typing import Optional
-
 from app.models.job import Job
-from app.database import AsyncSessionLocal
+from app.config.database import AsyncSessionLocal
 from app.services.media_analyzer import analyze_media
-from app.services.url_processor import analyze_url, get_youtube_video_id
-from app.services.converter import convert_media
-from app.services.cleanup import cleanup_old_files_and_jobs
+from app.services.converter import convert_audio
+from app.services.url_processor import analyze_url
 
 router = APIRouter()
 
 TEMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "temp")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-class AnalyzeUrlRequest(BaseModel):
-    url: str
+@router.post("/upload")
+async def upload_video(file: UploadFile = File(...)):
+    job_id = str(uuid.uuid4())
+    
+    file_extension = os.path.splitext(file.filename)[1] if file.filename else ".mp4"
+    safe_filename = f"{job_id}{file_extension}"
+    file_path = os.path.join(TEMP_DIR, safe_filename)
+    
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    try:
+        media_info = analyze_media(file_path)
+    except Exception as e:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise HTTPException(status_code=400, detail=f"Media analysis error: {str(e)}")
+        
+    async with AsyncSessionLocal() as db:
+        new_job = Job(
+            job_id=job_id,
+            status="pending",
+            input_type="upload",
+            input_filename=file.filename,
+            duration=media_info.get("duration"),
+            source_codec=media_info.get("audio_codec"),
+            source_bitrate=media_info.get("audio_bitrate")
+        )
+        db.add(new_job)
+        await db.commit()
+        
+    return {
+        "job_id": job_id,
+        "status": "pending",
+        "media_info": media_info
+    }
 
-class ConvertRequest(BaseModel):
-    job_id: str
-    output_format: str = "mp3"
-    bitrate: Optional[str] = "320k"
-    sample_rate: Optional[str] = "48000"
-    channels: Optional[str] = "2"
-    volume: Optional[float] = 1.0
-
-async def process_conversion_task(
-    job_id: str,
-    output_format: str,
-    bitrate: Optional[str],
-    sample_rate: Optional[str],
-    channels: Optional[str],
-    volume: Optional[float]
-):
+async def process_job_task(job_id: str, output_format: str, bitrate: str = None):
     async with AsyncSessionLocal() as db:
         job = await db.get(Job, job_id)
         if not job:
@@ -50,6 +67,7 @@ async def process_conversion_task(
     
     if is_url:
         import yt_dlp
+        # Download template
         download_template = os.path.join(TEMP_DIR, f"{job_id}_src.%(ext)s")
         ydl_opts = {
             'format': 'bestaudio/best',
@@ -69,6 +87,7 @@ async def process_conversion_task(
             }
         }
         
+        from app.services.url_processor import get_youtube_video_id
         target_url = source_url.strip()
         vid = get_youtube_video_id(target_url)
         if vid:
@@ -77,12 +96,14 @@ async def process_conversion_task(
             target_url = f"https://{target_url}"
 
         try:
+            # Run blocking yt-dlp in thread pool
             loop = asyncio.get_running_loop()
             def _download():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([target_url])
             await loop.run_in_executor(None, _download)
             
+            # Find the downloaded file
             matches = glob.glob(os.path.join(TEMP_DIR, f"{job_id}_src.*"))
             if matches:
                 input_path = matches[0]
@@ -97,10 +118,12 @@ async def process_conversion_task(
                     await db.commit()
             return
     else:
+        # Find uploaded file
         matches = glob.glob(os.path.join(TEMP_DIR, f"{job_id}.*"))
         if matches:
             input_path = matches[0]
         else:
+            # Fallback mp4
             input_path = os.path.join(TEMP_DIR, f"{job_id}.mp4")
 
     if not input_path or not os.path.exists(input_path):
@@ -108,60 +131,13 @@ async def process_conversion_task(
             job = await db.get(Job, job_id)
             if job:
                 job.status = "failed"
-                job.error_message = "Source media file not found."
+                job.error_message = "Source video file not found."
                 await db.commit()
         return
 
-    await convert_media(
-        job_id=job_id,
-        input_path=input_path,
-        output_path=output_path,
-        output_format=output_format,
-        bitrate=bitrate or "320k",
-        sample_rate=sample_rate or "48000",
-        channels=channels or "2",
-        volume=volume or 1.0
-    )
-
-@router.post("/upload")
-async def upload_video(file: UploadFile = File(...)):
-    async with AsyncSessionLocal() as db:
-        job = Job(
-            input_type="upload",
-            input_filename=file.filename,
-            file_size=file.size or 0,
-            status="analyzing"
-        )
-        db.add(job)
-        await db.commit()
-        await db.refresh(job)
-        job_id = job.id
-
-    ext = os.path.splitext(file.filename)[1] or ".mp4"
-    saved_path = os.path.join(TEMP_DIR, f"{job_id}{ext}")
-    
+    # Execute conversion
     try:
-        with open(saved_path, "wb") as f:
-            while chunk := await file.read(1024 * 1024):
-                f.write(chunk)
-                
-        media_info = analyze_media(saved_path)
-        
-        async with AsyncSessionLocal() as db:
-            job = await db.get(Job, job_id)
-            job.status = "analyzed"
-            job.duration = media_info.get("duration")
-            job.audio_codec = media_info.get("audio_codec")
-            job.audio_bitrate = media_info.get("audio_bitrate")
-            job.sample_rate = media_info.get("sample_rate")
-            job.channels = media_info.get("channels")
-            await db.commit()
-            
-        return {
-            "job_id": job_id,
-            "filename": file.filename,
-            "details": media_info
-        }
+        await convert_audio(job_id, input_path, output_path, output_format, bitrate)
     except Exception as e:
         async with AsyncSessionLocal() as db:
             job = await db.get(Job, job_id)
@@ -169,91 +145,105 @@ async def upload_video(file: UploadFile = File(...)):
                 job.status = "failed"
                 job.error_message = str(e)
                 await db.commit()
-        raise HTTPException(status_code=400, detail=f"Failed to process uploaded file: {str(e)}")
-
-@router.post("/analyze")
-async def analyze_online_url(req: AnalyzeUrlRequest):
-    try:
-        media_info = analyze_url(req.url)
-        
-        async with AsyncSessionLocal() as db:
-            job = Job(
-                input_type="url",
-                source_url=req.url,
-                input_filename=media_info.get("title", "Online Video"),
-                duration=media_info.get("duration"),
-                audio_codec=media_info.get("audio_codec"),
-                audio_bitrate=media_info.get("audio_bitrate"),
-                sample_rate=media_info.get("sample_rate"),
-                channels=media_info.get("channels"),
-                status="analyzed"
-            )
-            db.add(job)
-            await db.commit()
-            await db.refresh(job)
-            job_id = job.id
-            
-        return {
-            "job_id": job_id,
-            "url": req.url,
-            "details": media_info
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
 @router.post("/convert")
-async def start_conversion(req: ConvertRequest, background_tasks: BackgroundTasks):
-    async with AsyncSessionLocal() as db:
-        job = await db.get(Job, req.job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-        job.output_format = req.output_format
-        job.status = "pending"
-        job.progress = 0
-        await db.commit()
-
-    background_tasks.add_task(
-        process_conversion_task,
-        job_id=req.job_id,
-        output_format=req.output_format,
-        bitrate=req.bitrate,
-        sample_rate=req.sample_rate,
-        channels=req.channels,
-        volume=req.volume
-    )
-    
-    return {"job_id": req.job_id, "status": "queued"}
-
-@router.get("/progress/{job_id}")
-async def get_progress(job_id: str):
+async def convert_job(job_id: str, format: str, bitrate: str = None, background_tasks: BackgroundTasks = None):
     async with AsyncSessionLocal() as db:
         job = await db.get(Job, job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
+        
+        job.output_format = format
+        job.output_bitrate = bitrate
+        job.status = "analyzing"
+        job.progress = 10
+        await db.commit()
+        
+    if background_tasks:
+        background_tasks.add_task(process_job_task, job_id, format, bitrate)
+        
+    return {"job_id": job_id, "status": "processing"}
+
+@router.post("/analyze")
+async def analyze_url_endpoint(url: str):
+    try:
+        # Run analyze_url in thread pool to prevent blocking event loop
+        loop = asyncio.get_running_loop()
+        info = await loop.run_in_executor(None, analyze_url, url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+        
+    job_id = str(uuid.uuid4())
+    async with AsyncSessionLocal() as db:
+        new_job = Job(
+            job_id=job_id,
+            status="pending",
+            input_type="url",
+            source_url=url,
+            input_filename=info.get("title"),
+            duration=info.get("duration"),
+            source_codec=info.get("audio_codec"),
+            source_bitrate=info.get("audio_bitrate")
+        )
+        db.add(new_job)
+        await db.commit()
+        
+    return {
+        "job_id": job_id,
+        "status": "pending",
+        "media_info": info
+    }
+
+@router.get("/job/{job_id}")
+async def get_job_status(job_id: str):
+    async with AsyncSessionLocal() as db:
+        job = await db.get(Job, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
         return {
-            "job_id": job.id,
+            "job_id": job.job_id,
             "status": job.status,
             "progress": job.progress,
             "error_message": job.error_message,
-            "download_url": f"/api/download/{job.id}" if job.status == "completed" else None
+            "output_format": job.output_format
         }
 
 @router.get("/download/{job_id}")
-async def download_converted_file(job_id: str):
+async def download_job(job_id: str):
     async with AsyncSessionLocal() as db:
         job = await db.get(Job, job_id)
-        if not job or job.status != "completed":
-            raise HTTPException(status_code=404, detail="Converted file is not ready or has expired")
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job.status != "completed":
+            raise HTTPException(status_code=400, detail=f"Job is not completed yet (status: {job.status})")
+            
+        custom_name = job.input_filename or f"Audivault_{job_id}"
+        clean_name = "".join(c for c in custom_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+        if not clean_name:
+            clean_name = f"Audivault_{job_id}"
+            
+    matches = glob.glob(os.path.join(TEMP_DIR, f"{job_id}_out.*"))
+    if matches:
+        file_path = matches[0]
+        ext = os.path.splitext(file_path)[1].lower()
         
-        output_format = job.output_format or "mp3"
-        filename = f"{os.path.splitext(job.input_filename or 'audio')[0]}.{output_format}"
-
-    file_path = os.path.join(TEMP_DIR, f"{job_id}_out.{output_format}")
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Audio file not found on server or was automatically cleaned up.")
+        media_types = {
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".wav": "audio/wav",
+            ".flac": "audio/flac",
+        }
+        media_type = media_types.get(ext, "application/octet-stream")
+        download_filename = f"{clean_name}{ext}"
         
-    return FileResponse(
-        path=file_path,
-        media_type=f"audio/{output_format}",
-        filename=filename
-    )
+        return FileResponse(
+            file_path, 
+            media_type=media_type, 
+            filename=download_filename,
+            headers={
+                "Content-Disposition": f'attachment; filename="{download_filename}"'
+            }
+        )
+            
+    raise HTTPException(status_code=404, detail="Output file not found")
