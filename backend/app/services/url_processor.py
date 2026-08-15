@@ -5,20 +5,24 @@ def analyze_url(url: str) -> Dict[str, Any]:
     """
     Analyzes a URL using yt-dlp to extract metadata and available formats.
     """
+    clean_url = url.strip()
+    if not clean_url.startswith("http://") and not clean_url.startswith("https://"):
+        clean_url = f"https://{clean_url}"
+
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'ios', 'web']
+                'player_client': ['android']
             }
         }
     }
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(clean_url, download=False)
             if not info:
                 raise ValueError("No video information found for this URL.")
             
@@ -57,4 +61,9 @@ def analyze_url(url: str) -> Dict[str, Any]:
                 "formats": audio_formats
             }
     except Exception as e:
-        raise ValueError(f"Could not analyze URL: {str(e)}")
+        clean_err = str(e)
+        if "Sign in to confirm" in clean_err or "bot" in clean_err:
+            clean_err = "YouTube has restricted access to this video without login."
+        elif "Requested format is not available" in clean_err:
+            clean_err = "Audio stream is currently unavailable for this specific video."
+        raise ValueError(clean_err)

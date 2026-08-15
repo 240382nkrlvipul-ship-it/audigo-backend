@@ -78,7 +78,7 @@ async def process_job_task(job_id: str, output_format: str, bitrate: str = None)
             'overwrites': True,
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['android', 'ios', 'web']
+                    'player_client': ['android']
                 }
             }
         }
