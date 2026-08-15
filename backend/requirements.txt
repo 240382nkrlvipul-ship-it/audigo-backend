@@ -1,0 +1,8 @@
+fastapi>=0.111.0
+uvicorn>=0.30.0
+sqlalchemy>=2.0.30
+python-multipart>=0.0.9
+ffmpeg-python>=0.2.0
+yt-dlp>=2024.5.27
+pydantic-settings>=2.2.1
+aiosqlite>=0.20.0
