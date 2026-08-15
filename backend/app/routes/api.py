@@ -76,9 +76,6 @@ async def process_job_task(job_id: str, output_format: str, bitrate: str = None)
             'no_warnings': True,
             'noplaylist': True,
             'overwrites': True,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36'
-            },
             'extractor_args': {
                 'youtube': {
                     'player_client': ['android'],
