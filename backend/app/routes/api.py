@@ -84,6 +84,37 @@ async def process_job_task(job_id: str, output_format: str, bitrate: str = None)
             }
         }
         
+        # Check for cookies file or environment variable
+        cookies_path = os.path.join(os.path.dirname(TEMP_DIR), "cookies.txt")
+        if not os.path.exists(cookies_path) and os.environ.get("YOUTUBE_COOKIES"):
+            raw_cookies = os.environ.get("YOUTUBE_COOKIES").strip()
+            cookies_path = os.path.join(TEMP_DIR, "youtube_cookies.txt")
+            try:
+                import json
+                cookie_data = json.loads(raw_cookies)
+                if isinstance(cookie_data, list):
+                    lines = ["# Netscape HTTP Cookie File\n"]
+                    for c in cookie_data:
+                        dom = c.get("domain", ".youtube.com")
+                        sub = "TRUE" if dom.startswith(".") else "FALSE"
+                        p = c.get("path", "/")
+                        sec = "TRUE" if c.get("secure", False) else "FALSE"
+                        exp = str(int(c.get("expirationDate") or c.get("expires") or 2147483647))
+                        n = c.get("name", "")
+                        v = c.get("value", "")
+                        lines.append(f"{dom}\t{sub}\t{p}\t{sec}\t{exp}\t{n}\t{v}\n")
+                    with open(cookies_path, "w", encoding="utf-8") as cf:
+                        cf.writelines(lines)
+                else:
+                    with open(cookies_path, "w", encoding="utf-8") as cf:
+                        cf.write(raw_cookies)
+            except Exception:
+                with open(cookies_path, "w", encoding="utf-8") as cf:
+                    cf.write(raw_cookies)
+
+        if os.path.exists(cookies_path):
+            ydl_opts['cookiefile'] = cookies_path
+
         from app.services.url_processor import get_youtube_video_id
         target_url = source_url.strip()
         vid = get_youtube_video_id(target_url)
